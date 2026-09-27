@@ -1,14 +1,16 @@
-"""NCBI E-utilities PubMed search and fetch with auto-pagination.
+"""NCBI E-utilities PubMed search and fetch with history-based stable pagination.
 
 Usage: python search_pubmed.py <output_dir> <query_name> <query_term> [retmax] [sort]
   - output_dir: path to write results JSON
   - query_name: label for this query (e.g., "Q1_mechanism")
   - query_term: PubMed query string
-  - retmax: max results to fetch per page (default 60)
+  - retmax: cap on total records fetched (default MAX_TOTAL)
   - sort: relevance | date (default relevance)
 
-Auto-pagination: if total_count > retmax, automatically fetches all pages
-up to MAX_TOTAL (default 5000). Set retmax explicitly to cap at a lower number.
+The result set is frozen server-side via usehistory (WebEnv/QueryKey), so batched
+efetch calls cannot drift, duplicate or drop records even under relevance sorting.
+Rate limits follow NCBI policy: 3 req/s without an API key, 10 req/s with one
+(configure ~/.ncbi_config.json as {"api_key": "...", "email": "..."}).
 """
 import requests, json, os, time, pathlib, sys, xml.etree.ElementTree as ET
 from requests.adapters import HTTPAdapter
@@ -16,6 +18,8 @@ from urllib3.util.retry import Retry
 
 BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 MAX_TOTAL = 5000
+EFETCH_BATCH = 200
+
 _cfg_path = os.path.expanduser("~/.ncbi_config.json")
 cfg = {}
 if os.path.exists(_cfg_path):
@@ -24,50 +28,56 @@ if os.path.exists(_cfg_path):
 KEY = cfg.get("api_key", "")
 EMAIL = cfg.get("email", "researcher@example.com")
 
+DELAY = 0.12 if KEY else 0.4
+
 session = requests.Session()
 session.mount('https://', HTTPAdapter(max_retries=Retry(
     total=5, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])))
 
 
 def clean(text):
-    for c in [' ', ' ', '‐', '‑', ' ']:
+    for c in [' ', ' ', '‐', '‑', ' ']:
         text = text.replace(c, ' ')
     return text
 
 
 def _p(extra):
-    p = {"email": EMAIL}
+    p = {"email": EMAIL, "tool": "scientific_review"}
     if KEY:
         p["api_key"] = KEY
     p.update(extra)
     return p
 
 
-def esearch(term, retmax=60, retstart=0, sort="relevance"):
-    time.sleep(1.0)
+def esearch_history(term, sort="relevance"):
+    """Freeze the full result set on the NCBI history server."""
+    time.sleep(DELAY)
     r = session.get(f"{BASE}/esearch.fcgi", params=_p({
-        "db": "pubmed", "term": term, "retmax": retmax,
-        "retstart": retstart, "retmode": "json", "sort": sort
+        "db": "pubmed", "term": term, "retmax": 0,
+        "retmode": "json", "sort": sort, "usehistory": "y"
     }), timeout=30)
     r.raise_for_status()
-    return r.json()["esearchresult"]
+    res = r.json()["esearchresult"]
+    return int(res.get("count", 0)), res.get("webenv"), res.get("querykey")
 
 
-def efetch(ids):
-    """Fetch articles in batches of 200 (NCBI limit per efetch call)."""
-    all_articles = []
-    batch_size = 200
-    for i in range(0, len(ids), batch_size):
-        batch = ids[i:i + batch_size]
-        time.sleep(1.0)
+def efetch_batch(webenv, query_key, retstart, retmax):
+    """Fetch one batch from the frozen history; tolerate transient XML corruption."""
+    for attempt in range(3):
+        time.sleep(DELAY)
         r = session.get(f"{BASE}/efetch.fcgi", params=_p({
-            "db": "pubmed", "id": ",".join(str(x) for x in batch),
-            "retmode": "xml"
-        }), timeout=30)
+            "db": "pubmed", "query_key": query_key, "WebEnv": webenv,
+            "retstart": retstart, "retmax": retmax, "retmode": "xml"
+        }), timeout=60)
         r.raise_for_status()
-        tree = ET.fromstring(r.content)
-        all_articles.extend(parse_articles(tree))
-    return all_articles
+        try:
+            return parse_articles(ET.fromstring(r.content))
+        except ET.ParseError as e:
+            if attempt == 2:
+                print(f"  WARNING: batch retstart={retstart} unparsable after 3 attempts, skipped: {e}")
+                return []
+            time.sleep(2 * (attempt + 1))
+    return []
 
 
 def parse_articles(tree):
@@ -103,38 +113,13 @@ def parse_articles(tree):
             articles.append({
                 "pmid": pmid, "title": title, "journal": journal, "year": year,
                 "abstract": abstract, "authors": authors, "doi": doi,
-                "is_review": "Review" in pub_types, "pub_types": pub_types,
-                "mesh_terms": mesh_terms
+                "is_review": "Review" in pub_types, "is_preprint": False,
+                "pub_types": pub_types, "mesh_terms": mesh_terms,
+                "source": "pubmed"
             })
         except Exception as e:
             print(f"  Parse error for article: {e}")
     return articles
-
-
-def fetch_all_pages(qterm, retmax, sort, max_total=MAX_TOTAL):
-    """Auto-paginate: fetch all results up to max_total."""
-    result = esearch(qterm, retmax=min(retmax, 200), retstart=0, sort=sort)
-    total_count = int(result.get("count", 0))
-    first_page = result.get("idlist", [])
-
-    if total_count == 0:
-        return [], 0
-
-    actual_fetch = min(total_count, max_total)
-    if total_count <= len(first_page):
-        all_ids = first_page
-    else:
-        all_ids = list(first_page)
-        page_size = min(retmax, 200)
-        for start in range(page_size, actual_fetch, page_size):
-            result = esearch(qterm, retmax=page_size, retstart=start, sort=sort)
-            page_ids = result.get("idlist", [])
-            if not page_ids:
-                break
-            all_ids.extend(page_ids)
-
-    articles = efetch(all_ids)
-    return articles, total_count
 
 
 def main():
@@ -146,14 +131,20 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     qname = sys.argv[2]
     qterm = sys.argv[3]
-    retmax = int(sys.argv[4]) if len(sys.argv) > 4 else 60
+    retmax = int(sys.argv[4]) if len(sys.argv) > 4 else MAX_TOTAL
     sort = sys.argv[5] if len(sys.argv) > 5 else "relevance"
 
-    articles, total_count = fetch_all_pages(qterm, retmax, sort)
+    total_count, webenv, qkey = esearch_history(qterm, sort)
+    fetch_n = min(total_count, retmax, MAX_TOTAL)
+
+    articles = []
+    for start in range(0, fetch_n, EFETCH_BATCH):
+        articles.extend(efetch_batch(webenv, qkey, start, min(EFETCH_BATCH, fetch_n - start)))
 
     output = {
         "query_name": qname,
         "query_term": qterm,
+        "database": "pubmed",
         "total_count": total_count,
         "retrieved_count": len(articles),
         "articles": articles
@@ -164,8 +155,8 @@ def main():
         json.dump(output, f, ensure_ascii=False, indent=2)
 
     truncated_note = ""
-    if total_count > MAX_TOTAL:
-        truncated_note = f" (capped at {MAX_TOTAL})"
+    if total_count > fetch_n:
+        truncated_note = f" (capped at {fetch_n})"
     print(f"[{qname}] Total: {total_count} | Retrieved: {len(articles)}{truncated_note} | Written: {out_path}")
 
 

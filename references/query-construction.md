@@ -62,6 +62,10 @@ AND ("Breast Neoplasms"[MeSH] OR "breast cancer"[TIAB] OR "breast tumor"[TIAB])
 AND ("ferroptosis"[TIAB] OR "apoptosis"[TIAB] OR "cell death"[TIAB])
 ```
 
+## MeSH 时效性注意
+
+新发表论文的 MeSH 标引有数月滞后。检索近 1-2 年文献时，MeSH 查询必须与 TIAB 同义词查询并行，不能单独依赖 MeSH，否则系统性漏掉最新成果。预印本无 MeSH 标引——预印本覆盖见 `references/multi-source.md`。
+
 ## Adaptive Replan Triggers
 
 After initial search, check for these conditions before continuing:
